@@ -1,8 +1,7 @@
 // This is a new file added to the project.
-namespace FunctionsMcpTool
+namespace MCPFeeder;
+
+public class NewFile
 {
-    public class NewFile
-    {
-        // Add your code here.
-    }
+    // Add your code here.
 }
