@@ -80,19 +80,139 @@ If you're looking for this sample in other languages, check out the [Node.js/Typ
 
 ## Architecture Overview
 
-Below is the architecture diagram for the Remote MCP Server using Azure Functions:
+Below is the architecture diagram for the MCPFeeder Remote MCP Server using Azure Functions:
 
 ![Architecture Diagram](architecture-diagram.png)
 
-### Component Flow
+### Component Architecture
 
-1. **MCP Client** (VS Code, Copilot, MCP Inspector) sends HTTP request to the MCP endpoint
-2. **Azure Functions Worker** (.NET 8) receives the request
-3. **MCP Server** routes the tool invocation to `FeederTool.FeedUrl()`
-4. **FeederTool** extracts the URL parameter and invokes `FeedService`
-5. **FeedService** checks memory cache; if hit, returns cached feeds
-6. **Cache Miss**: Fetches RSS feed via HTTP, parses XML, filters by date
-7. **Results cached** for 24 hours and returned to the client
+MCPFeeder implements a **layered architecture** specifically optimized for RSS feed processing:
+
+| Layer | Component | Responsibility |
+|-------|-----------|----------------|
+| **Client Layer** | MCP Clients (VS Code, Copilot, MCP Inspector) | Sends HTTP requests to fetch feeds |
+| **Transport** | HTTP/HTTPS Protocol | Secure communication with system key authentication |
+| **Runtime** | Azure Functions Worker (.NET 8 Isolated) | Serverless compute platform |
+| **MCP Protocol** | MCP Server | Routes tool invocations and manages protocol |
+| **Tool Layer** | `FeederTool.FeedUrl()` | Exposes `get_feeds` as MCP tool |
+| **Business Logic** | `FeedService.GetFeedsAsync()` | RSS parsing, filtering, and caching |
+| **Cache Layer** | IMemoryCache (in-process) | 24-hour TTL for feed data |
+| **External Integration** | HTTP Client to Feed URLs | Fetches RSS feeds from remote sources |
+
+### Request-Response Flow
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│ MCP Client (Copilot, MCP Inspector, Custom Tools)         │
+│ Request: tool/call "get_feeds" with URL parameter         │
+└──────────────────────┬──────────────────────────────────────┘
+                       │
+                       ▼
+┌─────────────────────────────────────────────────────────────┐
+│ HTTPS Request to Azure Functions                           │
+│ POST /runtime/webhooks/mcp?code=<system_key>             │
+│ Content: JSON-RPC 2.0 tool invocation                     │
+└──────────────────────┬──────────────────────────────────────┘
+                       │
+                       ▼
+┌─────────────────────────────────────────────────────────────┐
+│ Azure Functions Worker (Runtime)                           │
+│ .NET 8 Isolated Worker Process                           │
+└──────────────────────┬──────────────────────────────────────┘
+                       │
+                       ▼
+┌─────────────────────────────────────────────────────────────┐
+│ MCP Server                                                  │
+│ Routes to: FeederTool.FeedUrl()                           │
+└──────────────────────┬──────────────────────────────────────┘
+                       │
+                       ▼
+┌─────────────────────────────────────────────────────────────┐
+│ FeederTool.FeedUrl()                                        │
+│ • Validates URL parameter                                  │
+│ • Calculates date range (last 24 hours)                   │
+│ • Calls FeedService.GetFeedsAsync()                       │
+└──────────────────────┬──────────────────────────────────────┘
+                       │
+                       ▼
+┌─────────────────────────────────────────────────────────────┐
+│ FeedService.GetFeedsAsync()                                 │
+│ Step 1: Check Memory Cache (24hr TTL)                     │
+│         ✓ Cache Hit → Return cached feeds                │
+│         ✗ Cache Miss → Proceed to step 2                 │
+└──────────────────────┬──────────────────────────────────────┘
+                       │
+                       ▼
+┌─────────────────────────────────────────────────────────────┐
+│ HTTP Client (15s timeout)                                  │
+│ Fetches RSS feed from provided URL                        │
+└──────────────────────┬──────────────────────────────────────┘
+                       │
+                       ▼
+┌─────────────────────────────────────────────────────────────┐
+│ XML Parser                                                  │
+│ • Parse RSS XML document                                   │
+│ • Extract items with pubDate, title, description, link    │
+│ • Filter items by date (last 24 hours only)              │
+│ • Clean HTML tags from descriptions                       │
+│ • Decode HTML entities                                    │
+└──────────────────────┬──────────────────────────────────────┘
+                       │
+                       ▼
+┌─────────────────────────────────────────────────────────────┐
+│ Memory Cache                                                │
+│ Save parsed RSSFeed objects with 24-hour TTL              │
+└──────────────────────┬──────────────────────────────────────┘
+                       │
+                       ▼
+┌─────────────────────────────────────────────────────────────┐
+│ Return Response                                             │
+│ Formatted text: [Title]\n[Content]\n[Link]\n[Date]\n\n... │
+│ Or error message if parsing failed                         │
+└──────────────────────┬──────────────────────────────────────┘
+                       │
+                       ▼
+┌─────────────────────────────────────────────────────────────┐
+│ JSON-RPC 2.0 Response                                       │
+│ Returns to MCP Client (Copilot) with tool output          │
+└──────────────────────┬──────────────────────────────────────┘
+                       │
+                       ▼
+┌─────────────────────────────────────────────────────────────┐
+│ MCP Client Processing                                       │
+│ Integrates feed data into AI context for analysis          │
+│ Can use for summarization, recommendations, etc.          │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### Data Model
+
+Each RSS feed item is represented as an `RSSFeed` record:
+
+```csharp
+public record RSSFeed
+{
+    public required string Title { get; init; }           // Article headline
+    public required string Content { get; init; }         // Cleaned description (no HTML)
+    public required string Link { get; init; }            // URL to full article
+    public DateTimeOffset PublishDate { get; init; }      // Publication timestamp
+}
+```
+
+### Caching Strategy
+
+- **Key**: `feeds_{url}_{startDate:yyyyMMdd}_{endDate:yyyyMMdd}`
+- **TTL**: 24 hours
+- **Hit Rate**: Optimizes requests when the same URL is queried within the same day
+- **Storage**: In-process memory (scales with function instance)
+
+### Security Architecture
+
+- **Authentication**: Azure Functions system keys (default)
+- **Transport**: HTTPS only in production
+- **Authorization**: Optional OAuth via EasyAuth or API Management
+- **Network**: Optional VNET isolation for private connectivity
+- **Monitoring**: Full audit trail in Application Insights
 
 ## Prepare your local environment
 
